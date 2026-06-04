@@ -1,0 +1,43 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# ── STT: Deepgram ─────────────────────────────────────────────────────────────
+httpx>=0.27.0
+
+# ── VAD: Silero VAD v5 ────────────────────────────────────────────────────────
+silero-vad>=5.1
+
+# ── Translation: HuggingFace MarianMT (Helsinki-NLP/opus-mt) ──────────────────
+transformers==4.44.0
+sentencepiece>=0.2.0
+sacremoses>=0.1.1
+
+# ── TTS: Kokoro ONNX ──────────────────────────────────────────────────────────
+kokoro-onnx>=0.4.0
+onnxruntime>=1.18.0              # CPU runtime; swap for onnxruntime-gpu if CUDA
+
+# ── Audio decoding ────────────────────────────────────────────────────────────
+soundfile>=0.12.1
+pydub>=0.25.1
+numpy>=1.26.0
+
+# ── Config ────────────────────────────────────────────────────────────────────
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# ── System requirement (not pip) ──────────────────────────────────────────────
+# ffmpeg must be installed:
+#   Ubuntu/Debian: apt-get install -y ffmpeg
+#   macOS:         brew install ffmpeg
+#   Windows:       winget install ffmpeg
+#
+# PyTorch (install separately before pip install -r requirements.txt):
+#   CPU:  pip install torch==2.4.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cpu
+#   CUDA: pip install torch==2.4.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+#
+# Kokoro model files (download once, place in project root):
+#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v1.0.onnx
+#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices-v1.0.bin

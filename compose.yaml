@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  audio-translate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: audio-translate-service-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist HuggingFace model cache so re-builds don't re-download MarianMT
+      - hf_cache:/root/.cache/huggingface
+      # Persist torch hub cache (Silero VAD)
+      - torch_cache:/root/.cache/torch
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - TORCH_HOME=/root/.cache/torch
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s   # give time for model pre-warm on first boot
+
+volumes:
+  hf_cache:
+  torch_cache:

@@ -1,0 +1,5 @@
+# Ignore all pycache folders anywhere in the project
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
