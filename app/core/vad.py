@@ -60,8 +60,8 @@ class SileroVAD:
     def __init__(
         self,
         threshold: float = 0.40,
-        min_speech_ms: int = 150,
-        min_silence_ms: int = 800,    # IMPORTANT: 800ms for live captions
+        min_speech_ms: int = 200,
+        min_silence_ms: int = 1000,    # IMPORTANT: 800ms for live captions
         sample_rate: int = 16000,
     ):
         self.threshold = threshold
@@ -131,8 +131,8 @@ class SileroVAD:
         Returns VADResult with event and probabilities.
 
         Key events:
-          SPEECH_START → open ElevenLabs stream
-          SPEECH_END   → close ElevenLabs stream (stops billing)
+          SPEECH_START → open deepgram stream
+          SPEECH_END   → close deepgram stream (stops billing)
         """
         if not self._loaded:
             raise RuntimeError("Silero VAD not loaded. Call .load() first.")

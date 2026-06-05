@@ -16,8 +16,8 @@ sentencepiece>=0.2.0
 sacremoses>=0.1.1
 
 # ── TTS: Kokoro ONNX ──────────────────────────────────────────────────────────
-kokoro-onnx>=0.4.0
-onnxruntime>=1.18.0              # CPU runtime; swap for onnxruntime-gpu if CUDA
+# kokoro-onnx>=0.4.0
+# onnxruntime>=1.18.0              # CPU runtime; swap for onnxruntime-gpu if CUDA
 
 # ── Audio decoding ────────────────────────────────────────────────────────────
 soundfile>=0.12.1

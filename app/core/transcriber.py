@@ -58,8 +58,6 @@ class DeepgramTranscriber:
         self.device       = "api"
         self.compute_type = "cloud"
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-
     def load(self) -> None:
         if not self.api_key:
             raise ValueError("DEEPGRAM_API_KEY not set. Add it to your .env file.")
@@ -68,8 +66,6 @@ class DeepgramTranscriber:
 
     def is_loaded(self) -> bool:
         return self._loaded
-
-    # ── STT stream ────────────────────────────────────────────────────────────
 
     async def open_stream(self, source_language: Optional[str] = None) -> None:
         if self._stream_open:
@@ -86,7 +82,9 @@ class DeepgramTranscriber:
             f"&channels=1"
             f"&interim_results=true"
             f"&punctuate=true"
-            f"&endpointing=false"
+            f"&endpointing=300"
+            f"&utterance_end_ms=1000"
+            f"&smart_format=true"
         )
         url     = DEEPGRAM_WS_URL + params
         headers = {"Authorization": f"Token {self.api_key}"}
@@ -236,14 +234,14 @@ class DeepgramTranscriber:
                         is_partial=not is_final,
                     ))
 
+                elif msg_type == "UtteranceEnd":
+                    logger.debug("[STT WS] UtteranceEnd received")
+
                 elif msg_type == "Metadata":
                     logger.debug(f"[STT WS] Metadata: {data}")
 
                 elif msg_type == "SpeechStarted":
                     logger.debug("[STT WS] Speech started")
-
-                elif msg_type == "UtteranceEnd":
-                    logger.debug("[STT WS] Utterance end")
 
                 elif msg_type == "Close":
                     logger.info("[STT WS] Close message received")
@@ -264,18 +262,11 @@ class DeepgramTranscriber:
             except asyncio.QueueFull:
                 pass
 
-    # ── TTS stream ────────────────────────────────────────────────────────────
-
     async def stream_tts(
         self,
         text: str,
         voice: str,
     ) -> AsyncGenerator[bytes, None]:
-        """
-        Open a Deepgram TTS WebSocket for the given text and voice.
-        Yields raw PCM binary chunks (linear16, 24kHz, mono) as they arrive.
-        voice must be a valid Deepgram Aura-2 model string e.g. aura-2-arcas-en
-        """
         if not text.strip():
             return
 
@@ -311,13 +302,11 @@ class DeepgramTranscriber:
                             evt = json.loads(message)
                             evt_type = evt.get("type", "")
                             if evt_type == "Flushed":
-                                logger.debug("[TTS WS] Flushed — all audio sent")
+                                logger.debug("[TTS WS] Flushed")
                                 break
                             elif evt_type == "Error":
                                 logger.error(f"[TTS WS] Server error: {evt}")
                                 break
-                            else:
-                                logger.debug(f"[TTS WS] Event: {evt_type}")
                         except json.JSONDecodeError:
                             pass
 
@@ -325,8 +314,6 @@ class DeepgramTranscriber:
             logger.info("[TTS WS] Connection closed")
         except Exception as e:
             logger.error(f"[TTS WS] Stream error: {e}", exc_info=True)
-
-    # ── REST path ─────────────────────────────────────────────────────────────
 
     async def atranscribe_segment(
         self,
@@ -349,6 +336,7 @@ class DeepgramTranscriber:
             "sample_rate": "16000",
             "channels":    "1",
             "punctuate":   "true",
+            "smart_format": "true",
         }
 
         try:
@@ -404,6 +392,4 @@ class DeepgramTranscriber:
             "device":       self.device,
             "compute_type": self.compute_type,
         }
-
-
 

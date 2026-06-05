@@ -191,6 +191,12 @@ async def stream_endpoint(
             return
 
         in_speech = False
+
+        # flush remaining buffered audio before closing
+        remaining = await buffer.export_and_clear()
+        if len(remaining) > 0:
+            await transcriber.send_audio(remaining)
+
         await transcriber.close_stream()
 
         if result_task and not result_task.done():
@@ -236,9 +242,6 @@ async def stream_endpoint(
 
                 if transcriber.is_stream_open and buffer.duration_seconds >= MAX_BUFFER_SECONDS:
                     logger.info("[WS] Hard buffer limit — forcing speech end")
-                    full_audio = await buffer.export_and_trim()
-                    if len(full_audio) > 0:
-                        await transcriber.send_audio(full_audio)
                     await on_speech_end()
 
                 continue
@@ -286,8 +289,6 @@ async def stream_endpoint(
                 if len(audio_f32) == 0 or is_silent(audio_f32):
                     continue
 
-                await buffer.push(audio_f32)
-
                 vad_speech_started = False
                 vad_speech_ended   = False
 
@@ -306,9 +307,10 @@ async def stream_endpoint(
                     await on_speech_start()
 
                 if in_speech and transcriber.is_stream_open:
-                    full_audio = await buffer.export_and_trim()
-                    if len(full_audio) > 0:
-                        await transcriber.send_audio(full_audio)
+                    await buffer.push(audio_f32)
+                    audio_to_send = await buffer.export_and_clear()
+                    if len(audio_to_send) > 0:
+                        await transcriber.send_audio(audio_to_send)
 
                 if vad_speech_ended and in_speech:
                     logger.debug("[WS] VAD: speech ended → closing STT stream")
