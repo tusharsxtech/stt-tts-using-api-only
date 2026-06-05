@@ -3,17 +3,21 @@ VAD (Voice Activity Detection) using Silero VAD v5.
 
 For live call captioning the key tuning is:
   - min_speech_ms = 150ms  → start capturing quickly, don't miss word beginnings
-  - min_silence_ms = 800ms → natural pause before closing ElevenLabs stream
+  - min_silence_ms = 800ms → natural pause before closing the STT stream
                               (too short = cuts mid-sentence; too long = delays captions)
   - threshold = 0.40       → slightly below default for sensitivity to soft speech
 
-The min_silence_ms here is the gate on the ElevenLabs API connection:
-  - While speech is detected  → ElevenLabs WS stays OPEN (billing active)
-  - After 800ms of silence    → SPEECH_END fires → ElevenLabs WS is CLOSED (billing stops)
-  - User starts speaking again → SPEECH_START fires → new ElevenLabs WS opened
+The min_silence_ms is the gate on the Deepgram STT connection:
+  - While speech is detected  → Deepgram WS stays OPEN
+  - After 800ms of silence    → SPEECH_END fires → Deepgram WS is CLOSED → FINAL result emitted
+  - User starts speaking again → SPEECH_START fires → new Deepgram WS opened
 
 This is different from the session idle timeout (120s) in websocket.py which handles
 complete inactivity — no audio from browser at all.
+
+NOTE: SileroVAD is NOT thread-safe. The singleton in websocket.py is used from a
+single asyncio event loop thread, so it is safe. If you ever move to multiple workers
+or threads, each worker needs its own instance.
 """
 
 import logging
@@ -49,8 +53,9 @@ class SileroVAD:
     Silence → Speech:  min_speech_ms  (default 150ms) fires SPEECH_START
     Speech → Silence:  min_silence_ms (default 800ms) fires SPEECH_END
 
-    800ms silence is the ElevenLabs connection gate. Set it via config:
-      VAD_MIN_SILENCE_MS=800
+    IMPORTANT: Not thread-safe. Use one instance per event-loop worker.
+    The shared singleton in websocket.py is safe because FastAPI/uvicorn
+    runs a single event loop per worker process.
     """
 
     SILERO_REPO = "snakers4/silero-vad"
@@ -60,8 +65,8 @@ class SileroVAD:
     def __init__(
         self,
         threshold: float = 0.40,
-        min_speech_ms: int = 200,
-        min_silence_ms: int = 1000,    # IMPORTANT: 800ms for live captions
+        min_speech_ms: int = 150,
+        min_silence_ms: int = 800,
         sample_rate: int = 16000,
     ):
         self.threshold = threshold
@@ -111,7 +116,7 @@ class SileroVAD:
         self._prob_history.clear()
 
     def reset_segment(self) -> None:
-        """Reset only segment counters after SPEECH_END (preserve model state)."""
+        """Reset only segment counters after SPEECH_END (preserve model hidden state)."""
         self._speech_samples   = 0
         self._silence_samples  = 0
         self._segment_samples  = 0
@@ -131,8 +136,13 @@ class SileroVAD:
         Returns VADResult with event and probabilities.
 
         Key events:
-          SPEECH_START → open deepgram stream
-          SPEECH_END   → close deepgram stream (stops billing)
+          SPEECH_START → open Deepgram STT stream
+          SPEECH_END   → close Deepgram STT stream (triggers FINAL result)
+
+        FIX: SPEECH_START no longer resets _silence_samples to 0 immediately.
+        Previously, if a brief noise caused a SPEECH_START mid-silence, the
+        silence counter was wiped even though we hadn't confirmed real speech.
+        Now silence_samples is only reset once _in_speech is confirmed True.
         """
         if not self._loaded:
             raise RuntimeError("Silero VAD not loaded. Call .load() first.")
@@ -152,11 +162,14 @@ class SileroVAD:
 
         if smoothed >= self.threshold:
             # Speech frame
-            self._silence_samples = 0
             self._speech_samples += num_samples
             if self._in_speech:
+                # Already confirmed speech — accumulate and reset silence counter
+                self._silence_samples = 0
                 self._segment_samples += num_samples
             if not self._in_speech and self._speech_samples >= self.min_speech_samples:
+                # Confirmed speech start — now reset silence counter
+                self._silence_samples = 0
                 self._in_speech = True
                 self._segment_samples = self._speech_samples
                 return VADResult(VADEvent.SPEECH_START, raw_prob, smoothed,
@@ -168,7 +181,6 @@ class SileroVAD:
             self._speech_samples = 0
             self._silence_samples += num_samples
             if self._in_speech and self._silence_samples >= self.min_silence_samples:
-                # Enough silence → fire SPEECH_END → ElevenLabs WS will close
                 event = VADEvent.SPEECH_END
                 self.reset_segment()
                 return VADResult(event, raw_prob, smoothed,

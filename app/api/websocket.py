@@ -10,7 +10,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.config import get_settings
 from app.core.audio_buffer import AudioBuffer
 from app.core.vad import SileroVAD, VADEvent
-from app.core.transcriber import DeepgramTranscriber
+from app.core.transcriber import DeepgramTranscriber, TranscriptionResult
 from app.core.translator import registry as translator_registry
 from app.models.schemas import TranslatedChunk, TTSVoice
 from app.utils.audio import (
@@ -21,7 +21,6 @@ from app.utils.lang_map import SUPPORTED_TARGET_LANGUAGES
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-MIN_AUDIO_SECONDS  = 0.3
 MAX_BUFFER_SECONDS = 10.0
 IDLE_CLOSE_SECONDS = 120.0
 
@@ -39,19 +38,42 @@ _ENCODING_MAP: dict[str, AudioFormat] = {
     "auto":      None,
 }
 
+# ── VAD singleton — loaded once at module level, shared across sessions ───────
+# FIX #4: Was re-loading Silero on every WebSocket connection (2s cold start per session).
+# The model itself is stateless; per-session state is managed via vad.reset_state().
+_vad_singleton: Optional[SileroVAD] = None
+
+def get_shared_vad(settings) -> SileroVAD:
+    global _vad_singleton
+    if _vad_singleton is None:
+        _vad_singleton = SileroVAD(
+            threshold=settings.vad_threshold,
+            min_speech_ms=settings.vad_min_speech_ms,
+            min_silence_ms=settings.vad_min_silence_ms,
+            sample_rate=16000,
+        )
+        _vad_singleton.load()
+        logger.info("[VAD] Singleton loaded.")
+    return _vad_singleton
+
 
 async def _tts_task(
     text: str,
     voice: str,
     transcriber: DeepgramTranscriber,
     websocket: WebSocket,
+    ws_open_flag: list[bool],          # FIX #3: mutable flag checked before each send
 ) -> None:
     try:
         async for pcm_chunk in transcriber.stream_tts(text=text, voice=voice):
+            # FIX #3: Guard — don't attempt send if WebSocket already closed
+            if not ws_open_flag[0]:
+                logger.debug("[TTS] WebSocket closed, aborting TTS stream.")
+                return
             try:
                 await websocket.send_bytes(pcm_chunk)
             except Exception as e:
-                logger.error(f"[TTS] Failed to send audio chunk to client: {e}")
+                logger.error(f"[TTS] Failed to send audio chunk: {e}")
                 return
     except Exception as e:
         logger.error(f"[TTS] Task error: {e}", exc_info=True)
@@ -93,13 +115,8 @@ async def stream_endpoint(
         f"sr={sample_rate} enc={encoding} voice={voice}"
     )
 
-    vad = SileroVAD(
-        threshold=settings.vad_threshold,
-        min_speech_ms=settings.vad_min_speech_ms,
-        min_silence_ms=settings.vad_min_silence_ms,
-        sample_rate=16000,
-    )
-    vad.load()
+    # FIX #4: Get shared VAD, reset per-session state only
+    vad = get_shared_vad(settings)
     vad.reset_state()
 
     buffer           = AudioBuffer(sample_rate=16000, max_seconds=MAX_BUFFER_SECONDS)
@@ -109,92 +126,128 @@ async def stream_endpoint(
     total_chunks     = 0
     session_closed   = False
 
+    # FIX #3: Mutable flag so background TTS tasks know when WS is gone
+    ws_open = [True]
+
     webm_header: bytes        = b""
     is_first_webm_chunk: bool = True
 
     result_task: Optional[asyncio.Task] = None
+    last_partial: Optional[TranscriptionResult] = None
 
     async def stream_results_to_client() -> None:
+        nonlocal last_partial
         try:
-            async for transcript in transcriber.aiter_results():
-                if not transcript.text.strip():
+            async for item in transcriber.aiter_results():
+                if item == "utterance_end":
+                    if last_partial is not None:
+                        final = last_partial
+                        last_partial = None
+                        await _emit(final, is_final=True)
                     continue
 
-                try:
-                    translated = await translator_registry.translate_one(
-                        text=transcript.text,
-                        source_lang=transcript.language,
-                        target_lang=target_lang,
-                    )
-                except ValueError as e:
-                    logger.warning(f"[RESULT] Lang pair not supported: {e}")
-                    translated = transcript.text
-                except Exception as e:
-                    logger.error(f"[RESULT] Translation failed: {e}", exc_info=True)
-                    translated = transcript.text
+                result: TranscriptionResult = item
+                if not result.text.strip():
+                    continue
 
-                chunk = TranslatedChunk(
-                    original_text=transcript.text,
-                    translated_text=translated,
-                    source_language=transcript.language,
-                    target_language=target_lang,
-                    start_time=round(time.time() - stream_start, 3),
-                    end_time=round(time.time() - stream_start, 3),
-                    is_partial=transcript.is_partial,
-                )
-
-                label = "PARTIAL" if transcript.is_partial else "FINAL"
-                logger.info(
-                    f"[{label}] {transcript.language}→{target_lang} | "
-                    f'"{transcript.text[:60]}" → "{translated[:60]}"'
-                )
-
-                try:
-                    await websocket.send_json(chunk.model_dump())
-                except Exception as e:
-                    logger.error(f"[RESULT] WebSocket caption send failed: {e}")
-                    return
-
-                if not transcript.is_partial and translated.strip():
-                    asyncio.create_task(
-                        _tts_task(
-                            text=translated,
-                            voice=voice,
-                            transcriber=transcriber,
-                            websocket=websocket,
-                        )
-                    )
+                if result.is_partial:
+                    last_partial = result
+                    await _emit(result, is_final=False)
+                else:
+                    last_partial = None
+                    await _emit(result, is_final=True)
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"[RESULT] Streamer error: {e}", exc_info=True)
 
-    async def on_speech_start() -> None:
-        nonlocal result_task, in_speech
-        if transcriber.is_stream_open:
+    async def _emit(result: TranscriptionResult, is_final: bool) -> None:
+        try:
+            translated = await translator_registry.translate_one(
+                text=result.text,
+                source_lang=result.language,
+                target_lang=target_lang,
+            )
+        except ValueError as e:
+            logger.warning(f"[RESULT] Lang pair not supported: {e}")
+            translated = result.text
+        except Exception as e:
+            logger.error(f"[RESULT] Translation failed: {e}", exc_info=True)
+            translated = result.text
+
+        chunk = TranslatedChunk(
+            original_text=result.text,
+            translated_text=translated,
+            source_language=result.language,
+            target_language=target_lang,
+            start_time=round(time.time() - stream_start, 3),
+            end_time=round(time.time() - stream_start, 3),
+            is_partial=not is_final,
+        )
+
+        label = "PARTIAL" if not is_final else "FINAL"
+        logger.info(
+            f"[{label}] {result.language}→{target_lang} | "
+            f'"{result.text[:60]}" → "{translated[:60]}"'
+        )
+
+        # FIX #3: Only send if WebSocket is still open
+        if not ws_open[0]:
             return
 
         try:
-            await transcriber.open_stream(source_language=source_lang)
-            result_task = asyncio.create_task(stream_results_to_client())
-            in_speech = True
-            logger.info("[WS] STT stream opened — speech started")
+            await websocket.send_json(chunk.model_dump())
         except Exception as e:
-            logger.error(f"[WS] Failed to open STT stream: {e}", exc_info=True)
-            await websocket.send_json({"error": f"STT stream open failed: {e}"})
-
-    async def on_speech_end() -> None:
-        nonlocal in_speech
-        if not transcriber.is_stream_open:
-            in_speech = False
+            logger.error(f"[RESULT] WebSocket send failed: {e}")
             return
 
+        if is_final and translated.strip() and ws_open[0]:
+            asyncio.create_task(
+                _tts_task(
+                    text=translated,
+                    voice=voice,
+                    transcriber=transcriber,
+                    websocket=websocket,
+                    ws_open_flag=ws_open,   # pass the live flag
+                )
+            )
+
+    async def ensure_stream_open() -> None:
+        nonlocal result_task
+        if transcriber.is_stream_open:
+            return
+        await transcriber.open_stream(source_language=source_lang)
+        if result_task is None or result_task.done():
+            result_task = asyncio.create_task(stream_results_to_client())
+        logger.info("[WS] STT stream opened")
+
+    # FIX #1 + #5: Flush audio and close the STT stream on SPEECH_END so
+    # Deepgram finalizes the utterance. Reset in_speech so next speech
+    # re-opens the stream cleanly.
+    async def on_speech_end() -> None:
+        nonlocal in_speech
+        logger.info("[VAD] SPEECH_END — flushing audio, closing STT stream for finalization")
         in_speech = False
 
-        # flush remaining buffered audio before closing
         remaining = await buffer.export_and_clear()
-        if len(remaining) > 0:
+        if len(remaining) > 0 and transcriber.is_stream_open:
+            await transcriber.send_audio(remaining)
+
+        # Close the STT stream so Deepgram emits is_final=True for the utterance.
+        # The result_task keeps draining until it gets the sentinel None from aiter_results.
+        # A new stream will be opened on the next SPEECH_START.
+        await transcriber.close_stream()
+        logger.info("[VAD] STT stream closed after SPEECH_END — awaiting final result")
+
+    async def close_session() -> None:
+        nonlocal session_closed
+        if session_closed:
+            return
+        session_closed = True
+
+        remaining = await buffer.export_and_clear()
+        if len(remaining) > 0 and transcriber.is_stream_open:
             await transcriber.send_audio(remaining)
 
         await transcriber.close_stream()
@@ -205,27 +258,7 @@ async def stream_endpoint(
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 result_task.cancel()
 
-        logger.info("[WS] STT stream closed — speech ended")
-
-    async def close_session_idle() -> None:
-        nonlocal session_closed
-        if session_closed:
-            return
-        session_closed = True
-
-        logger.info(f"[WS] Idle timeout ({IDLE_CLOSE_SECONDS}s) — closing session")
-        await on_speech_end()
-        try:
-            await websocket.send_json({
-                "event": "silence_timeout",
-                "message": f"Closed after {int(IDLE_CLOSE_SECONDS)}s of silence.",
-            })
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1000)
-        except Exception:
-            pass
+        logger.info("[WS] Session closed")
 
     try:
         while True:
@@ -235,22 +268,24 @@ async def stream_endpoint(
                 )
             except asyncio.TimeoutError:
                 now = time.time()
-
                 if (now - last_speech_time) >= IDLE_CLOSE_SECONDS:
-                    await close_session_idle()
+                    logger.info(f"[WS] Idle timeout — closing session")
+                    await close_session()
+                    try:
+                        await websocket.send_json({
+                            "event": "silence_timeout",
+                            "message": f"Closed after {int(IDLE_CLOSE_SECONDS)}s of silence.",
+                        })
+                    except Exception:
+                        pass
                     break
-
-                if transcriber.is_stream_open and buffer.duration_seconds >= MAX_BUFFER_SECONDS:
-                    logger.info("[WS] Hard buffer limit — forcing speech end")
-                    await on_speech_end()
-
                 continue
 
             if message["type"] == "websocket.receive" and "text" in message:
                 cmd = message["text"].strip().upper()
                 if cmd == "STOP":
                     logger.info("[WS] Client sent STOP")
-                    await on_speech_end()
+                    await close_session()
                     break
                 if cmd == "PING":
                     await websocket.send_text("PONG")
@@ -289,31 +324,43 @@ async def stream_endpoint(
                 if len(audio_f32) == 0 or is_silent(audio_f32):
                     continue
 
-                vad_speech_started = False
-                vad_speech_ended   = False
+                # FIX #1 + #2: Process ALL chunks — don't break early on SPEECH_START.
+                # Also handle SPEECH_END to flush + finalize the utterance.
+                speech_started_this_frame = False
+                speech_ended_this_frame   = False
 
                 for vc in chunk_audio(audio_f32, vad.CHUNK_SIZE):
                     result = vad.process_chunk(vc)
+
                     if result.event == VADEvent.SPEECH_START:
-                        vad_speech_started = True
+                        speech_started_this_frame = True
+                        # Don't break — keep processing remaining chunks
+
                     elif result.event == VADEvent.SPEECH_END:
-                        vad_speech_ended = True
-                        break
+                        speech_ended_this_frame = True
+                        # Don't break — there may be more chunks after silence
 
-                if vad_speech_started or (in_speech and not vad_speech_ended):
+                # Act on events after processing the full frame
+                if speech_started_this_frame and not in_speech:
+                    in_speech = True
                     last_speech_time = time.time()
+                    await ensure_stream_open()
 
-                if vad_speech_started and not in_speech:
-                    await on_speech_start()
+                if speech_ended_this_frame and not in_speech:
+                    # in_speech was already reset inside on_speech_end,
+                    # but SPEECH_END from VAD may come first — handle cleanly
+                    pass
 
-                if in_speech and transcriber.is_stream_open:
+                if in_speech:
+                    last_speech_time = time.time()
                     await buffer.push(audio_f32)
                     audio_to_send = await buffer.export_and_clear()
-                    if len(audio_to_send) > 0:
+                    if len(audio_to_send) > 0 and transcriber.is_stream_open:
                         await transcriber.send_audio(audio_to_send)
 
-                if vad_speech_ended and in_speech:
-                    logger.debug("[WS] VAD: speech ended → closing STT stream")
+                # FIX #1: Trigger finalization after the frame is fully processed
+                # and audio has been flushed to Deepgram.
+                if speech_ended_this_frame:
                     await on_speech_end()
 
             elif message["type"] == "websocket.disconnect":
@@ -329,9 +376,13 @@ async def stream_endpoint(
         except Exception:
             pass
     finally:
+        # FIX #3: Mark WS as closed BEFORE any remaining cleanup
+        ws_open[0] = False
+
         if result_task and not result_task.done():
             result_task.cancel()
-        await transcriber.close_stream()
+        if not session_closed:
+            await transcriber.close_stream()
         await buffer.clear()
         logger.info(
             f"[WS] Session ended | chunks={total_chunks} "

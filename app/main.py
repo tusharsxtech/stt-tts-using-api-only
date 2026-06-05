@@ -1,5 +1,5 @@
 # FastAPI application entry point for Audio Transcribe, Translate & TTS Service
-# Lifespan manages Deepgram STT init and translation model pre-warming on startup
+# Lifespan manages Deepgram STT init, VAD singleton init, and translation model pre-warming on startup
 
 import logging
 from contextlib import asynccontextmanager
@@ -9,8 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.api.websocket import router as ws_router
-# from app.api.rest import router as rest_router
+from app.api.websocket import router as ws_router, get_shared_vad
 from app.core.transcriber import DeepgramTranscriber
 from app.core.translator import registry as translator_registry
 
@@ -28,6 +27,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("=== Audio Translate Service starting ===")
 
+    # STT
     transcriber = DeepgramTranscriber(
         api_key=settings.deepgram_api_key,
         model_id=settings.deepgram_model,
@@ -36,6 +36,12 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(transcriber.load)
     app.state.transcriber = transcriber
 
+    # FIX: Pre-load VAD singleton at startup (not per-session).
+    # get_shared_vad() is idempotent — safe to call here and from websocket handlers.
+    await asyncio.to_thread(get_shared_vad, settings)
+    logger.info("Silero VAD pre-loaded at startup.")
+
+    # Translation models
     common_pairs = [("en", "hi"), ("en", "fr"), ("en", "de"), ("en", "es"),
                     ("hi", "en"), ("fr", "en"), ("de", "en"), ("es", "en")]
     logger.info("Pre-warming common translation models...")
@@ -55,7 +61,6 @@ def create_app() -> FastAPI:
         description=(
             "Real-time audio → transcription → translation → TTS microservice.\n\n"
             "**WebSocket** `/ws/stream/{target_lang}` for live streaming.\n"
-            
         ),
         version="2.0.0",
         lifespan=lifespan,
@@ -72,7 +77,6 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(ws_router, tags=["streaming"])
-    # app.include_router(rest_router, tags=["pipeline"])
 
     @app.get("/", include_in_schema=False)
     async def root():

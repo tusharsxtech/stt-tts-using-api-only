@@ -54,13 +54,17 @@ class DeepgramTranscriber:
         self._stream_open  = False
         self._stream_lang: str = "en"
 
+        # FIX: asyncio.Lock to prevent concurrent open_stream() calls from
+        # racing (e.g. rapid SPEECH_START events opening the stream twice).
+        self._open_lock = asyncio.Lock()
+
         self.model_size   = f"deepgram/{model_id}"
         self.device       = "api"
         self.compute_type = "cloud"
 
     def load(self) -> None:
         if not self.api_key:
-            raise ValueError("DEEPGRAM_API_KEY not set. Add it to your .env file.")
+            raise ValueError("DEEPGRAM_API_KEY not set.")
         self._loaded = True
         logger.info(f"Deepgram STT ready. model={self.model_id}")
 
@@ -68,49 +72,56 @@ class DeepgramTranscriber:
         return self._loaded
 
     async def open_stream(self, source_language: Optional[str] = None) -> None:
-        if self._stream_open:
-            return
+        # FIX: Lock prevents a second concurrent call from opening a second
+        # WebSocket connection while the first is still being established.
+        async with self._open_lock:
+            if self._stream_open:
+                return
 
-        lang = source_language or self.language_code
-        self._stream_lang = lang
+            lang = source_language or self.language_code
+            self._stream_lang = lang
 
-        params = (
-            f"?model={self.realtime_model_id}"
-            f"&language={lang}"
-            f"&encoding=linear16"
-            f"&sample_rate=16000"
-            f"&channels=1"
-            f"&interim_results=true"
-            f"&punctuate=true"
-            f"&endpointing=300"
-            f"&utterance_end_ms=1000"
-            f"&smart_format=true"
-        )
-        url     = DEEPGRAM_WS_URL + params
-        headers = {"Authorization": f"Token {self.api_key}"}
-
-        try:
-            self._ws = await websockets.connect(
-                url,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=30,
-                open_timeout=10,
+            params = (
+                f"?model={self.realtime_model_id}"
+                f"&language={lang}"
+                f"&encoding=linear16"
+                f"&sample_rate=16000"
+                f"&channels=1"
+                f"&interim_results=true"
+                f"&punctuate=true"
+                f"&smart_format=true"
+                f"&endpointing=300"
+                f"&utterance_end_ms=1000"
             )
-            self._stream_open  = True
-            self._audio_queue  = asyncio.Queue()
-            self._result_queue = asyncio.Queue()
+            url     = DEEPGRAM_WS_URL + params
+            headers = {"Authorization": f"Token {self.api_key}"}
 
-            self._send_task = asyncio.create_task(self._sender_loop())
-            self._recv_task = asyncio.create_task(self._receiver_loop())
+            try:
+                self._ws = await websockets.connect(
+                    url,
+                    additional_headers=headers,
+                    ping_interval=10,
+                    ping_timeout=20,
+                    open_timeout=10,
+                )
+                self._stream_open  = True
+                # FIX: Always create fresh queues when opening a new stream.
+                # Old queues from a previous session may still have stale data
+                # or a lingering None sentinel from close_stream(), which would
+                # immediately poison aiter_results() on the new stream.
+                self._audio_queue  = asyncio.Queue()
+                self._result_queue = asyncio.Queue()
 
-            logger.info(f"[STT WS] Stream opened. lang={lang} model={self.realtime_model_id}")
+                self._send_task = asyncio.create_task(self._sender_loop())
+                self._recv_task = asyncio.create_task(self._receiver_loop())
 
-        except Exception as e:
-            self._stream_open = False
-            self._ws          = None
-            logger.error(f"[STT WS] Failed to open stream: {e}", exc_info=True)
-            raise
+                logger.info(f"[STT WS] Stream opened. lang={lang} model={self.realtime_model_id}")
+
+            except Exception as e:
+                self._stream_open = False
+                self._ws          = None
+                logger.error(f"[STT WS] Failed to open stream: {e}", exc_info=True)
+                raise
 
     async def send_audio(self, audio: np.ndarray) -> None:
         if not self._stream_open or audio is None or len(audio) == 0:
@@ -124,6 +135,8 @@ class DeepgramTranscriber:
             return
 
         logger.info("[STT WS] Closing stream")
+        self._stream_open = False
+
         await self._audio_queue.put(None)
 
         if self._send_task and not self._send_task.done():
@@ -145,8 +158,14 @@ class DeepgramTranscriber:
                 pass
             self._ws = None
 
-        self._stream_open = False
-        await self._result_queue.put(None)
+        # FIX: Only put the sentinel if the queue doesn't already have one.
+        # _receiver_loop's finally block also puts None; putting a second one
+        # means the NEXT session's aiter_results() exits immediately on first get().
+        try:
+            self._result_queue.put_nowait(None)
+        except Exception:
+            pass
+
         logger.info("[STT WS] Stream closed.")
 
     async def close(self) -> None:
@@ -159,10 +178,11 @@ class DeepgramTranscriber:
     async def aiter_results(self) -> AsyncGenerator[TranscriptionResult, None]:
         while True:
             try:
-                item = await asyncio.wait_for(self._result_queue.get(), timeout=30.0)
+                item = await asyncio.wait_for(self._result_queue.get(), timeout=60.0)
             except asyncio.TimeoutError:
-                logger.warning("[STT WS] Result queue timeout")
-                break
+                if not self._stream_open:
+                    break
+                continue
             if item is None:
                 break
             yield item
@@ -173,14 +193,14 @@ class DeepgramTranscriber:
                 chunk = await self._audio_queue.get()
 
                 if chunk is None:
-                    if self._ws and self._stream_open:
+                    if self._ws:
                         try:
                             await self._ws.send(json.dumps({"type": "CloseStream"}))
                         except Exception as e:
                             logger.debug(f"[STT WS] CloseStream send error: {e}")
                     break
 
-                if not self._ws or not self._stream_open:
+                if not self._ws:
                     break
 
                 try:
@@ -235,13 +255,14 @@ class DeepgramTranscriber:
                     ))
 
                 elif msg_type == "UtteranceEnd":
-                    logger.debug("[STT WS] UtteranceEnd received")
+                    logger.debug("[STT WS] UtteranceEnd — sentence boundary")
+                    await self._result_queue.put("utterance_end")
 
                 elif msg_type == "Metadata":
                     logger.debug(f"[STT WS] Metadata: {data}")
 
                 elif msg_type == "SpeechStarted":
-                    logger.debug("[STT WS] Speech started")
+                    logger.debug("[STT WS] SpeechStarted")
 
                 elif msg_type == "Close":
                     logger.info("[STT WS] Close message received")
@@ -249,6 +270,7 @@ class DeepgramTranscriber:
 
                 elif msg_type == "Error":
                     logger.error(f"[STT WS] Server error: {data}")
+                    break
 
         except ConnectionClosed:
             logger.info("[STT WS] Connection closed by server")
@@ -257,9 +279,14 @@ class DeepgramTranscriber:
         except Exception as e:
             logger.error(f"[STT WS] Receiver loop error: {e}", exc_info=True)
         finally:
+            # FIX: Only put the sentinel if one isn't already queued.
+            # close_stream() also puts None; a double-sentinel means the next
+            # session's aiter_results() exits immediately without reading anything.
             try:
-                self._result_queue.put_nowait(None)
-            except asyncio.QueueFull:
+                # Check if queue is empty before adding sentinel to avoid duplicates.
+                if self._result_queue.empty():
+                    self._result_queue.put_nowait(None)
+            except Exception:
                 pass
 
     async def stream_tts(
@@ -299,7 +326,7 @@ class DeepgramTranscriber:
                             yield message
                     elif isinstance(message, str):
                         try:
-                            evt = json.loads(message)
+                            evt      = json.loads(message)
                             evt_type = evt.get("type", "")
                             if evt_type == "Flushed":
                                 logger.debug("[TTS WS] Flushed")
@@ -330,12 +357,12 @@ class DeepgramTranscriber:
         logger.info(f"[HTTP STT] Sending {duration:.2f}s audio. model={self.model_id}")
 
         params = {
-            "model":       self.model_id,
-            "language":    source_language or self.language_code,
-            "encoding":    "linear16",
-            "sample_rate": "16000",
-            "channels":    "1",
-            "punctuate":   "true",
+            "model":        self.model_id,
+            "language":     source_language or self.language_code,
+            "encoding":     "linear16",
+            "sample_rate":  "16000",
+            "channels":     "1",
+            "punctuate":    "true",
             "smart_format": "true",
         }
 
@@ -392,4 +419,3 @@ class DeepgramTranscriber:
             "device":       self.device,
             "compute_type": self.compute_type,
         }
-
